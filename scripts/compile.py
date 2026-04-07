@@ -10,10 +10,10 @@ compile.py - raw/ 마크다운 파일을 주제별 wiki 페이지로 컴파일
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 import frontmatter
-import google.generativeai as genai
 
 sys.path.insert(0, str(Path(__file__).parent))
 from categories import CATEGORY_SLUGS, get_display, get_slug
@@ -81,21 +81,57 @@ def load_raw_files() -> dict[str, list[dict]]:
     return groups
 
 
-def compile_category(slug: str, articles: list[dict], model) -> str:
+def _call_llm(prompt: str, model: dict, retries: int = 3) -> str:
+    """provider에 따라 LLM 호출 (rate limit 시 재시도)"""
+    provider = model["provider"]
+    for attempt in range(retries):
+        try:
+            if provider == "anthropic":
+                response = model["client"].messages.create(
+                    model=model["name"],
+                    max_tokens=4096,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return response.content[0].text
+            else:  # gemini
+                response = model["client"].generate_content(prompt)
+                return response.text
+        except Exception as e:
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                wait = 60 * (attempt + 1)
+                print(f"    Rate limit — {wait}초 대기 후 재시도 ({attempt+1}/{retries})...")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("LLM 호출 실패: 재시도 횟수 초과")
+
+
+MAX_ARTICLES_PER_CATEGORY = 15
+CHARS_PER_ARTICLE = 2000
+
+
+def compile_category(slug: str, articles: list[dict], model: dict) -> str:
     """slug에 해당하는 wiki 페이지 생성 후 파일에 저장, 요약 반환"""
     display = get_display(slug)
+
+    # 최신 아티클 우선, 최대 MAX_ARTICLES_PER_CATEGORY개
+    selected = sorted(
+        articles,
+        key=lambda a: a.get("publishedAt", "") or "",
+        reverse=True,
+    )[:MAX_ARTICLES_PER_CATEGORY]
+
     articles_text = ""
-    for i, a in enumerate(articles, 1):
+    for i, a in enumerate(selected, 1):
         articles_text += f"### 아티클 {i}: {a['title']}\n"
         articles_text += f"시리즈: {a['seriesTitle']} | 저자: {a['authorName']} | 게시일: {a['publishedAt']}\n\n"
-        articles_text += a["content"][:4000]  # 토큰 절약을 위해 앞 4000자만
+        articles_text += a["content"][:CHARS_PER_ARTICLE]
         articles_text += "\n\n---\n\n"
 
     prompt = COMPILE_PROMPT.format(display_name=display, articles_text=articles_text)
 
-    print(f"  Gemini 호출: {slug} ({len(articles)}개 아티클)...")
-    response = model.generate_content(prompt)
-    wiki_text = response.text
+    print(f"  LLM 호출 ({model['provider']}): {slug} ({len(articles)}개 아티클)...")
+    wiki_text = _call_llm(prompt, model)
 
     # 파일 헤더 추가
     header = f"---\nslug: {slug}\ncategory: {display}\nupdated: {_today()}\narticle_count: {len(articles)}\n---\n\n"
@@ -113,21 +149,45 @@ def compile_category(slug: str, articles: list[dict], model) -> str:
     return display
 
 
-def update_index(slug_summaries: dict[str, str]):
-    """wiki/INDEX.md 전체 갱신"""
-    # 기존 INDEX.md에서 slug_summaries에 없는 항목도 유지
-    existing: dict[str, str] = {}
-    index_file = WIKI_DIR / "INDEX.md"
-    if index_file.exists():
-        for line in index_file.read_text(encoding="utf-8").splitlines():
-            if line.startswith("|") and ".md" in line:
-                parts = [p.strip() for p in line.split("|")]
-                if len(parts) >= 4 and parts[2].endswith(".md"):
-                    slug = parts[2].replace(".md", "")
-                    summary = parts[3] if len(parts) > 3 else ""
-                    existing[slug] = summary
+def _extract_first_sentence(wiki_file: Path) -> str:
+    """wiki 파일에서 frontmatter 이후 첫 의미있는 문장 추출"""
+    try:
+        lines = wiki_file.read_text(encoding="utf-8").splitlines()
+        # frontmatter 건너뛰기 (--- ... ---)
+        in_frontmatter = False
+        past_frontmatter = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped == "---":
+                if not past_frontmatter:
+                    in_frontmatter = not in_frontmatter
+                    if not in_frontmatter:
+                        past_frontmatter = True
+                    continue
+            if in_frontmatter:
+                continue
+            # frontmatter 이후 첫 비어있지 않은 내용 줄
+            text = stripped.lstrip("#").strip()
+            if text and not text.startswith("|") and not text.startswith(">"):
+                return text[:60]
+    except Exception:
+        pass
+    return ""
 
-    # 업데이트
+
+def update_index(slug_summaries: dict[str, str]):
+    """wiki/INDEX.md 전체 갱신 (wiki/ 디렉토리의 모든 .md 파일 포함)"""
+    existing: dict[str, str] = {}
+
+    # wiki/ 디렉토리의 모든 slug.md 스캔
+    if WIKI_DIR.exists():
+        for wiki_file in WIKI_DIR.glob("*.md"):
+            if wiki_file.name == "INDEX.md":
+                continue
+            slug = wiki_file.stem
+            existing[slug] = _extract_first_sentence(wiki_file)
+
+    # 새로 컴파일된 항목으로 요약 업데이트
     existing.update(slug_summaries)
 
     rows = ""
@@ -136,7 +196,7 @@ def update_index(slug_summaries: dict[str, str]):
         rows += f"| {display} | {slug}.md | {summary} |\n"
 
     WIKI_DIR.mkdir(exist_ok=True)
-    index_file.write_text(INDEX_HEADER + rows, encoding="utf-8")
+    (WIKI_DIR / "INDEX.md").write_text(INDEX_HEADER + rows, encoding="utf-8")
     print(f"  ✓ wiki/INDEX.md 갱신 ({len(existing)}개 주제)")
 
 
@@ -152,15 +212,37 @@ def main():
         nargs="*",
         help="변경된 raw/ 파일 경로 목록 (없으면 전체 재컴파일)",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="이미 wiki/ 에 파일이 있는 slug는 건너뜀",
+    )
     args = parser.parse_args()
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("[오류] GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
-        sys.exit(1)
+    # LLM 선택: ANTHROPIC_API_KEY 우선, 없으면 GEMINI_API_KEY
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    gemini_key = os.environ.get("GEMINI_API_KEY")
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    if anthropic_key:
+        import anthropic
+        model = {
+            "provider": "anthropic",
+            "name": "claude-haiku-4-5-20251001",
+            "client": anthropic.Anthropic(api_key=anthropic_key),
+        }
+        print("LLM: Claude Haiku (Anthropic)")
+    elif gemini_key:
+        import google.generativeai as genai
+        genai.configure(api_key=gemini_key)
+        model = {
+            "provider": "gemini",
+            "name": "gemini-2.0-flash",
+            "client": genai.GenerativeModel("gemini-2.0-flash"),
+        }
+        print("LLM: Gemini Flash")
+    else:
+        print("[오류] ANTHROPIC_API_KEY 또는 GEMINI_API_KEY 환경변수가 필요합니다.")
+        sys.exit(1)
 
     all_groups = load_raw_files()
     if not all_groups:
@@ -188,13 +270,20 @@ def main():
         print(f"전체 컴파일: {len(target_slugs)}개 카테고리")
 
     slug_summaries: dict[str, str] = {}
-    for slug in sorted(target_slugs):
+    slugs = sorted(target_slugs)
+    for i, slug in enumerate(slugs):
         articles = all_groups.get(slug, [])
         if not articles:
             print(f"  건너뜀: {slug} (아티클 없음)")
             continue
+        if args.skip_existing and (WIKI_DIR / f"{slug}.md").exists():
+            print(f"  건너뜀: {slug} (이미 존재)")
+            continue
         summary = compile_category(slug, articles, model)
         slug_summaries[slug] = summary
+        # 카테고리 간 rate limit 방지 (마지막 제외)
+        if i < len(slugs) - 1:
+            time.sleep(15)
 
     update_index(slug_summaries)
     print("\n컴파일 완료!")

@@ -5,6 +5,7 @@ description = "자연 치유 LLM Wiki 빌드 스크립트"
 requires-python = ">=3.11"
 dependencies = [
     "google-generativeai>=0.8.0",
+    "anthropic>=0.40.0",
     "python-frontmatter>=1.1.0",
     "pyyaml>=6.0",
     "firebase-admin>=6.0.0",
